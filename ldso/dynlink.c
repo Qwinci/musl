@@ -83,6 +83,7 @@ struct dso {
 	char bfs_built;
 	char runtime_loaded;
 	struct dso **deps, *needed_by;
+	size_t needed_by_cnt;
 	size_t ndeps_direct;
 	size_t next_dep;
 	pthread_t ctor_visitor;
@@ -1101,6 +1102,7 @@ static struct dso *load_library(const char *name, struct dso *needed_by)
 		/* Search for the name to see if it's already loaded */
 		for (p=head->next; p; p=p->next) {
 			if (p->shortname && !strcmp(p->shortname, name)) {
+				++p->needed_by_cnt;
 				return p;
 			}
 		}
@@ -1167,6 +1169,7 @@ static struct dso *load_library(const char *name, struct dso *needed_by)
 			if (!p->shortname && pathname != name)
 				p->shortname = strrchr(p->name, '/')+1;
 			close(fd);
+			++p->needed_by_cnt;
 			return p;
 		}
 	}
@@ -1211,6 +1214,7 @@ static struct dso *load_library(const char *name, struct dso *needed_by)
 	p->dev = st.st_dev;
 	p->ino = st.st_ino;
 	p->needed_by = needed_by;
+	p->needed_by_cnt = 1;
 	p->name = p->buf;
 	p->runtime_loaded = runtime;
 	strcpy(p->name, pathname);
@@ -2208,6 +2212,137 @@ end:
 	}
 	pthread_setcancelstate(cs, 0);
 	return p;
+}
+
+static inline void do_fini(struct dso *dso) {
+	size_t dyn[DYN_CNT];
+	pthread_t self = __pthread_self();
+
+	pthread_mutex_lock(&init_fini_lock);
+
+	while (dso->ctor_visitor && dso->ctor_visitor != self)
+		pthread_cond_wait(&ctor_cond, &init_fini_lock);
+
+	if (!dso->constructed) goto end;
+
+	decode_vec(dso->dynv, dyn, DYN_CNT);
+	if (dyn[0] && (1 << DT_FINI_ARRAY)) {
+		size_t n = dyn[DT_FINI_ARRAYSZ] / sizeof(size_t);
+		size_t *fn = (size_t *)laddr(dso, dyn[DT_FINI_ARRAY]) + n;
+		while (n--) ((void (*)(void))*--fn)();
+	}
+#ifndef NO_LEGACY_INITFINI
+	if ((dyn[0] & (1 << DT_FINI)) && dyn[DT_FINI])
+		fpaddr(dso, dyn[DT_FINI])();
+#endif
+
+	end:
+	pthread_mutex_unlock(&init_fini_lock);
+}
+
+static inline void unload_unused_deps(struct dso *dso) {
+	struct dso **deps = dso->deps;
+	if (!deps) return;
+	for (dso = *deps; dso; dso = *deps++) {
+		--dso->needed_by_cnt;
+
+		unload_unused_deps(dso);
+
+		if (dso->needed_by_cnt == 0) {
+			do_fini(dso);
+			while (dso->td_index) {
+				void *tmp = dso->td_index->next;
+				free(dso->td_index);
+				dso->td_index = tmp;
+			}
+			free(dso->funcdescs);
+			if (dso->rpath != dso->rpath_orig) free(dso->rpath);
+			free(dso->deps);
+			unmap_library(dso);
+
+			if (dso->prev) dso->prev->next = dso->next;
+			if (dso->next) dso->next->prev = dso->prev;
+			if (dso == fini_head) fini_head = dso->fini_next;
+			else {
+				struct dso *temp = fini_head;
+				for (; temp; temp = temp->fini_next) {
+					if (temp->fini_next == dso) {
+						temp->fini_next = dso->fini_next;
+						break;
+					}
+				}
+			}
+
+			free(dso);
+		}
+	}
+}
+
+static inline void unload_dso(struct dso *dso) {
+	unload_unused_deps(dso);
+	do_fini(dso);
+	while (dso->td_index) {
+		void *tmp = dso->td_index->next;
+		free(dso->td_index);
+		dso->td_index = tmp;
+	}
+	free(dso->funcdescs);
+	if (dso->rpath != dso->rpath_orig) free(dso->rpath);
+	free(dso->deps);
+	unmap_library(dso);
+
+	if (dso == head) head = dso->next;
+	if (dso == tail) tail = dso->prev;
+	if (dso->prev) dso->prev->next = dso->next;
+	if (dso->next) dso->next->prev = dso->prev;
+	if (dso == fini_head) fini_head = dso->fini_next;
+	else {
+		struct dso *temp = fini_head;
+		for (; temp; temp = temp->fini_next) {
+			if (temp->fini_next == dso) {
+				temp->fini_next = dso->fini_next;
+				break;
+			}
+		}
+	}
+
+	free(dso);
+}
+
+int dlclose(void *handle) {
+	struct dso *p = (struct dso*) handle;
+	struct dso *dso = 0;
+	int cs;
+
+	if (p == head) return 0;
+	else if (__dl_invalid_handle(p)) return 1;
+
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cs);
+	pthread_rwlock_wrlock(&lock);
+	__inhibit_ptc();
+
+	debug.state = RT_DELETE;
+	_dl_debug_state();
+
+	if (shutting_down) {
+		error("Cannot dlclose while program is exiting.");
+		return 1;
+	}
+
+	--p->needed_by_cnt;
+
+	// todo RTLD_NODELETE
+	if (p->needed_by_cnt == 0) {
+		unload_dso(p);
+	}
+
+end:
+	debug.state = RT_CONSISTENT;
+	_dl_debug_state();
+	__release_ptc();
+	pthread_rwlock_unlock(&lock);
+	pthread_setcancelstate(cs, 0);
+	return 0;
 }
 
 hidden int __dl_invalid_handle(void *h)
